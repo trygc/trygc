@@ -2,6 +2,10 @@ import { createServer } from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
+import { promisify } from "node:util";
+
+const gzipAsync = promisify(zlib.gzip);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const siteRoot = path.join(__dirname, "site");
@@ -23,11 +27,26 @@ const contentTypes = new Map([
   [".webmanifest", "application/manifest+json; charset=utf-8"],
   [".woff", "font/woff"],
   [".woff2", "font/woff2"],
-  [".xml", "application/xml; charset=utf-8"]
+  [".xml", "application/xml; charset=utf-8"],
+]);
+
+const compressible = new Set([
+  "text/css; charset=utf-8",
+  "text/html; charset=utf-8",
+  "application/javascript; charset=utf-8",
+  "application/json; charset=utf-8",
+  "image/svg+xml",
+  "text/plain; charset=utf-8",
+  "application/xml; charset=utf-8",
 ]);
 
 function sanitize(urlPath) {
-  const pathname = decodeURIComponent((urlPath || "/").split("?")[0]);
+  let pathname = (urlPath || "/").split("?")[0];
+  try {
+    pathname = decodeURIComponent(pathname);
+  } catch {
+    pathname = "/";
+  }
   const normalized = path.normalize(pathname).replace(/^(\.\.(\/|\\|$))+/, "");
   return normalized.startsWith(path.sep) ? normalized.slice(1) : normalized;
 }
@@ -40,7 +59,7 @@ async function readFileIfPresent(filePath) {
 
   return {
     body: await fs.readFile(filePath),
-    filePath
+    filePath,
   };
 }
 
@@ -66,6 +85,20 @@ async function resolveRequestPath(requestPath) {
   return readFileIfPresent(path.join(siteRoot, "index.html"));
 }
 
+function cacheControlFor(filePath) {
+  const rel = path.relative(siteRoot, filePath).replace(/\\/g, "/");
+  if (rel.startsWith("_next/static/")) {
+    return "public, max-age=31536000, immutable";
+  }
+  if (rel === "react-build" || rel.startsWith("react-build/")) {
+    return "public, max-age=31536000, immutable";
+  }
+  if (/\.(png|jpg|jpeg|gif|ico|webp|woff2?|svg)$/.test(rel)) {
+    return "public, max-age=86400";
+  }
+  return "no-cache";
+}
+
 const server = createServer(async (req, res) => {
   const resolved = await resolveRequestPath(req.url);
 
@@ -77,12 +110,37 @@ const server = createServer(async (req, res) => {
 
   const ext = path.extname(resolved.filePath).toLowerCase();
   const contentType = contentTypes.get(ext) || "application/octet-stream";
+  const cacheControl = cacheControlFor(resolved.filePath);
 
-  res.writeHead(200, {
-    "Cache-Control": "no-cache",
-    "Content-Type": contentType
-  });
-  res.end(resolved.body);
+  let body = resolved.body;
+  const headers = {
+    "Cache-Control": cacheControl,
+    "Content-Type": contentType,
+    "X-Content-Type-Options": "nosniff",
+  };
+
+  const enc = String(req.headers["accept-encoding"] || "");
+  const mayCompress =
+    enc.includes("gzip") &&
+    compressible.has(contentType) &&
+    body.length > 512;
+
+  if (mayCompress) {
+    try {
+      const compressed = await gzipAsync(body);
+      if (compressed.length < body.length) {
+        body = compressed;
+        headers["Content-Encoding"] = "gzip";
+        headers.Vary = "Accept-Encoding";
+      }
+    } catch {
+      /* send uncompressed */
+    }
+  }
+
+  headers["Content-Length"] = String(body.length);
+  res.writeHead(200, headers);
+  res.end(body);
 });
 
 server.listen(port, "127.0.0.1", () => {
